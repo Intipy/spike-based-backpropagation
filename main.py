@@ -1,391 +1,524 @@
-from __future__ import print_function
 import argparse
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torchvision import datasets, transforms, models
-from torch.utils.data.dataloader import DataLoader
-from torch.autograd import Variable
-from torchviz import make_dot
-from matplotlib import pyplot as plt
-from matplotlib.gridspec import GridSpec
-import numpy as np
-import datetime
-import pdb
-from self_models import *
-import sys
 import os
 import shutil
+import time
+import math
+import torch
+import torch.nn as nn
+import torch.nn.parallel
+import torch.backends.cudnn as cudnn
+from torch.autograd import Variable
+import torch.optim
+import torch.utils.data
+import torchvision.transforms as transforms
+import torchvision.models as models
+import torchvision.datasets as dsets
 
-use_cuda = True
-#use cuda
-#torch.manual_seed(2)
-if torch.cuda.is_available() and use_cuda:
-    print ("\n \t ------- Running on GPU -------")
-    #torch.cuda.set_device(int(sys.argv[1]))
-    torch.set_default_tensor_type('torch.cuda.FloatTensor')
+import torch._utils
+try:
+    torch._utils._rebuild_tensor_v2
+except AttributeError:
+    def _rebuild_tensor_v2(storage, storage_offset, size, stride, requires_grad, backward_hooks):
+        tensor = torch._utils._rebuild_tensor(storage, storage_offset, size, stride)
+        tensor.requires_grad = requires_grad
+        tensor._backward_hooks = backward_hooks
+        return tensor
+    torch._utils._rebuild_tensor_v2 = _rebuild_tensor_v2
+
+model_names = sorted(name for name in models.__dict__
+                     if name.islower() and not name.startswith("__")
+                     and callable(models.__dict__[name]))
+parser = argparse.ArgumentParser(description='PyTorch MNIST Training')
+parser.add_argument('--dataset', default='MNIST', type=str, help='dataset = [MNIST]')
+parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet18',
+                    choices=model_names,
+                    help='model architecture: ' +
+                         ' | '.join(model_names) +
+                         ' (default: resnet18)')
+parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
+                    help='manual epoch number (useful on restarts)')
+parser.add_argument('-b', '--batch-size', default=64, type=int,
+                    metavar='N', help='mini-batch size (default: 100)')
+parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
+                    help='momentum')
+parser.add_argument('--weight-decay', '--wd', default=5e-4, type=float,
+                    metavar='W', help='weight decay (default: 1e-4)')
+parser.add_argument('--print-freq', '-p', default=500, type=int,
+                    metavar='N', help='print frequency (default: 10)')
+parser.add_argument('--resume', default='', type=str, metavar='PATH',
+                    help='path to latest checkpoint (default: none)')
+parser.add_argument('-load', default='', type=str, metavar='PATH',
+                    help='path to training mask (default: none)')
+parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
+                    help='evaluate model on validation set')
+parser.add_argument('--pretrained', dest='pretrained', action='store_true',
+                    help='use pre-trained model')
+parser.add_argument('--lr', '--learning-rate', default=0.0085, type=float,
+                    metavar='LR', help='initial learning rate')
+parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+                    help='number of data loading workers (default: 4)')
+parser.add_argument('--epochs', default=125, type=int, metavar='N',
+                    help='number of total epochs to run')
+
+best_prec1 = 0
+change = 75
+tp1 = [];
+tp5 = [];
+ep = [];
+lRate = [];
+device_num = 1
+
+tp1_tr = [];
+tp5_tr = [];
+losses_tr = [];
+losses_eval = [];
+
+def main():
+    global args, best_prec1, batch_size, device_num
+
+    args = parser.parse_args()
+    batch_size = args.batch_size
+    model = CNNModel()
+    torch.manual_seed(1)
+    torch.cuda.manual_seed_all(42)
+
+    if device_num < 3:
+        device = 0
+        torch.cuda.set_device(device)
+        model.cuda()
+    else:
+        model = torch.nn.DataParallel(model).cuda()
+
+    criterion = torch.nn.MSELoss(size_average=False).cuda()
+    criterion_en = torch.nn.CrossEntropyLoss()
+
+    learning_rate = args.lr
+    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, weight_decay=5e-4)
+
+    # optionally resume from a checkpoint
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print("=> loading checkpoint '{}'".format(args.resume))
+            checkpoint = torch.load(args.resume)
+            args.start_epoch = checkpoint['epoch']
+            best_prec1 = checkpoint['best_prec1']
+            model.load_state_dict(checkpoint['state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            print("=> loaded checkpoint '{}' (epoch {})"
+                  .format(args.resume, checkpoint['epoch']))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume))
+
+    cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = True
+
+    '''STEP 1: LOADING DATASET'''
+    train_data = dsets.MNIST(root='./data', train=True, transform=transforms.ToTensor(), download=True)
+    val_data = dsets.MNIST(root='./data', train=False, transform=transforms.ToTensor())
+
+    train_loader = torch.utils.data.DataLoader(dataset=train_data, batch_size=args.batch_size, shuffle=True)
+    val_loader = torch.utils.data.DataLoader(dataset=val_data, batch_size=int(args.batch_size), shuffle=False)
+
+    if args.evaluate:
+        validate(val_loader, model, criterion, criterion_en, time_steps=100, leak=0.99)
+        return
+
+    prec1_tr = 0
+    for epoch in range(args.start_epoch, args.epochs):
+        adjust_learning_rate(optimizer, epoch)
+        ep.append(epoch)
+
+        # train for one epoch
+        prec1_tr = train(train_loader, model, criterion, criterion_en, optimizer, epoch, time_steps=100, leak=0.99)
+
+        # evaluate on validation set
+        prec1 = validate(val_loader, model, criterion, criterion_en, time_steps=100, leak=0.99)
 
 
-def find_threshold(ann_thresholds, loader):
-    
-    pos=0
-    
-    def find(layer, pos):
-        max_act=0
-        
-        if architecture.lower().startswith('vgg'):
-            if layer == (len(model.module.features) + len(model.module.classifier) -1):
-                return None
+        # remember best prec@1 and save checkpoint
+        is_best = prec1 > best_prec1
+        best_prec1 = max(prec1, best_prec1)
+        save_checkpoint({
+            'epoch': epoch + 1,
+            'arch': args.arch,
+            'state_dict': model.state_dict(),
+            'best_prec1': best_prec1,
+            'optimizer': optimizer.state_dict(),
+        }, is_best)
 
-        for batch_idx, (data, target) in enumerate(loader):
-            
-            if torch.cuda.is_available() and use_cuda:
-                data, target = data.cuda(), target.cuda()
+    for k in range(0, args.epochs - args.start_epoch):
+        print('Epoch: [{0}/{1}]\t'
+              'LR:{2}\t'
+              'Prec@1 {top1:.3f} \t'
+              'Prec@5 {top5:.3f} '.format(
+            ep[k], args.epochs, lRate[k], top1=tp1[k], top5=tp5[k]))
 
-            with torch.no_grad():
-                model.eval()
-                model.module.network_init(timesteps)
-                output = model(data, 0, find_max_mem=True, max_mem_layer=layer)
-                
-                if output>max_act:
-                    max_act = output.item()
-                f.write('\nBatch:{} Current:{:.4f} Max:{:.4f}'.format(batch_idx+1,output.item(),max_act))
-                if batch_idx==0:
-                    ann_thresholds[pos] = max_act
-                    pos = pos+1
-                
-                    model.module.threshold_init(scaling_threshold=scaling_threshold, reset_threshold=reset_threshold, thresholds = ann_thresholds[:], default_threshold=default_threshold)
-                    break
-        return pos
 
-    if architecture.lower().startswith('vgg'):              
-        for l in model.module.features.named_children():
-            if isinstance(l[1], nn.Conv2d):
-                pos = find(int(l[0]), pos)
-        
-        for c in model.module.classifier.named_children():
-            if isinstance(c[1], nn.Linear):
-                pos = find(int(l[0])+int(c[0])+1, pos)
+def grad_cal(l, LF_output, Total_output):
+    Total_output = Total_output + (Total_output < 1e-3).type(torch.cuda.FloatTensor)
+    out = LF_output.gt(1e-3).type(torch.cuda.FloatTensor) + math.log(l) * torch.div(LF_output, Total_output)
+    return out
 
-    if architecture.lower().startswith('res'):
-        for l in model.module.pre_process.named_children():
-            if isinstance(l[1], nn.Conv2d):
-                pos = find(int(l[0]), pos)
 
-def train(epoch, loader):
+def train(train_loader, model, criterion, criterion_en, optimizer, epoch, time_steps, leak):
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
 
-    global learning_rate, start_time
-    learning_rate_use = learning_rate * (lr_decay_factor**(epoch//lr_adjust_interval))
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = learning_rate_use
-    
-    f.write('Epoch: {} Learning Rate: {:.2e}'.format(epoch,learning_rate_use))
-    
-    total_loss = 0.0
-    total_correct = 0
+    top1_tr = AverageMeter()
+    top5_tr = AverageMeter()
+    losses_en = AverageMeter()
+
+    # switch to train mode
     model.train()
-       
-    current_time = start_time
-    model.module.network_init(update_interval)
 
-    for batch_idx, (data, target) in enumerate(loader):
-               
-        if torch.cuda.is_available() and use_cuda:
-            data, target = data.cuda(), target.cuda()
-        
-        t=0
-        mem = 0
-        spike =0
-        mask = 0
-        spike_count = 0
-               
-        optimizer.zero_grad()
-        while t<timesteps:
-            
-            output, mem, spike, mask, spike_count = model(data, t, mem, spike, mask, spike_count) 
-            output = output/(t+update_interval)
-            loss = criterion(output, target)
-            loss = F.cross_entropy(output,target)
-            loss.backward()
-            t = t + update_interval
-            total_loss = loss.item()
-       
-        optimizer.step()        
-        pred = output.max(1,keepdim=True)[1]
-        correct = pred.eq(target.data.view_as(pred)).cpu().sum()
-        total_correct += correct.item()
-        
-        if (batch_idx+1) % 10 == 0:
-            
-            f.write('\nEpoch: {} [{}/{} ({:.0f}%)] Loss: {:.6f} Current:[{}/{} ({:.2f}%)] Total:[{}/{} ({:.2f}%)] Time: {}({})'.format(
-                epoch,
-                (batch_idx+1) * len(data),
-                len(loader.dataset),
-                100. * (batch_idx+1) / len(loader),
-                total_loss/(batch_idx+1),
-                correct.item(),
-                data.size(0),
-                100. * correct.item()/data.size(0),
-                total_correct,
-                data.size(0)*(batch_idx+1),
-                100. * total_correct/(data.size(0)*(batch_idx+1)),
-                datetime.timedelta(seconds=(datetime.datetime.now() - start_time).seconds),
-                datetime.timedelta(seconds=(datetime.datetime.now() - current_time).seconds)
-                )
-            )
-            current_time = datetime.datetime.now()
-      
-def test(epoch, loader):
+    end = time.time()
+    for i, (input, target) in enumerate(train_loader):
+        # measure data loading time
+        data_time.update(time.time() - end)
+        target = target.cuda(async=True)
+        labels = Variable(target.cuda())
+        if device_num < 2:
+            input_var = Variable(input.cuda())
+        else:
+            input_var = torch.autograd.Variable(input)
 
-    with torch.no_grad():
-        model.eval()
-        total_loss = 0
-        correct = 0
-        is_best = False
-        print_accuracy_every_batch = True
-        global max_correct
-        
-        for batch_idx, (data, target) in enumerate(loader):
-                        
-            if torch.cuda.is_available() and use_cuda:
-                data, target = data.cuda(), target.cuda()
-            
-            model.module.network_init(timesteps)
-            output, _, _, _, spike_count = model(data, 0)
-            
-            #for key in spike_count.keys():
-            #    print('Key: {}, Average: {:.3f}'.format(key, (spike_count[key].sum()/spike_count[key].numel())))
-            
-            loss = F.cross_entropy(output,target)
-            total_loss += loss.item()
-            pred = output.max(1, keepdim=True)[1]
-            correct += pred.eq(target.data.view_as(pred)).cpu().sum()
-            
-            if print_accuracy_every_batch:
-                
-                f.write('\nAccuracy: {}/{}({:.2f}%)'.format(
-                    correct.item(),
-                    (batch_idx+1)*data.size(0),
-                    100. * correct.item() / ((batch_idx+1)*data.size(0))
-                    )
-                )
-            
-        if correct>max_correct:
-            max_correct = correct
-            is_best = True          
-        
-        state = {
-                'accuracy'              : max_correct.item()/len(test_loader.dataset),
-                'epoch'                 : epoch,
-                'state_dict'            : model.state_dict(),
-                'optimizer'             : optimizer.state_dict(),
-                'thresholds'            : ann_thresholds,
-                'timesteps'             : timesteps,
-                'leak_mem'              : leak_mem,
-                'scaling_threshold'     : scaling_threshold,
-                'activation'            : activation
-            }
-        filename = 'snn_'+architecture.lower()+'_'+dataset.lower()+'_'+str(timesteps)+'_'+str(update_interval)+'.pth'
-        torch.save(state,filename)    
-        
-        if is_best:
-            shutil.copyfile(filename, 'best_'+filename)
+        optimizer.zero_grad()  # Clear gradients w.r.t. parameters
 
-        f.write('\nTest set: Loss: {:.6f}, Current: {:.2f}%, Best: {:.2f}%\n'.  format(
-            total_loss/(batch_idx+1), 
-            100. * correct.item() / len(test_loader.dataset),
-            100. * max_correct.item() / len(test_loader.dataset)
-            )
-        )
+        output, Total_1_output, LF_1_output, Total_2_output, LF_2_output, Total_f0_output, LF_f0_output, out1_temp, out2_temp, outf0_temp = model(input_var, steps=time_steps, l=leak)
 
-    
-dataset             = 'CIFAR10' # {'CIFAR10', 'CIFAR100', 'IMAGENET'}
-batch_size          = 64
-timesteps           = 200
-update_interval     = 200
-num_workers         = 4
-leak_mem            = 0.99
-scaling_threshold   = 0.7
-reset_threshold     = 0.0
-default_threshold   = 1.0
-activation          = 'STDB' # {'Linear', 'STDB'}
-architecture        = 'VGG16' # {'VGG5','VGG9','VGG16','RESNET18','RESNET34'}
-print_to_file       = False
-log_file            = 'snn_'+architecture.lower()+'_'+dataset.lower()+'_'+str(timesteps)+'_'+str(update_interval)+'_'+activation.lower()+'.log'
-pretrained          = True
-pretrained_state    = './best_snn_vgg16_cifar10.pth'
-find_thesholds      = False
-freeze_conv         = False
-resume              = False
-#resume              = './snn_vgg11_cifar100_125.pth'
-learning_rate       = 1e-4
-lr_adjust_interval  = 5
-lr_decay_factor     = 0.5 # {0.1, 0.5, 1.0}
-STDP_alpha          = 0.3
-STDP_beta           = 0.01
+        # compute gradient
+        NG_C1 = grad_cal(leak, LF_1_output, Total_1_output)
+        NG_C2 = grad_cal(leak, LF_2_output, Total_2_output)
+        NG_F0 = grad_cal(leak, LF_f0_output, Total_f0_output)
 
-if print_to_file:
-    f = open(log_file, 'w', buffering=1)
-else:
-    f = sys.stdout
+        # apply gradient
+        for z in range(time_steps):
+            out1_temp[z].register_hook(lambda grad: torch.mul(grad, NG_C1))
+            out2_temp[z].register_hook(lambda grad: torch.mul(grad, NG_C2))
+            outf0_temp[z].register_hook(lambda grad: torch.mul(grad, NG_F0))
+
+        targetN = output.data.clone().zero_().cuda()
+        targetN.scatter_(1, target.unsqueeze(1), 1)
+        targetN = Variable(targetN.type(torch.cuda.FloatTensor))
+
+        loss = criterion(output, targetN)
+        loss_en = criterion_en(output, labels).cuda()
+
+        # measure accuracy and record loss
+        prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+        losses.update(loss.data[0], input.size(0))
+        top1.update(prec1[0], input.size(0))
+        top5.update(prec5[0], input.size(0))
+
+        prec1_tr, prec5_tr = accuracy(output.data, target, topk=(1, 5))
+        losses_en.update(loss_en.data[0], input.size(0))
+        top1_tr.update(prec1_tr[0], input.size(0))
+        top5_tr.update(prec5_tr[0], input.size(0))
+
+        # compute gradient and do SGD step
+        loss.backward(retain_variables=False)
+        optimizer.step()
+
+        out1_temp, NG_C1 = None, None
+        out2_temp, NG_C2 = None, None
+        outf0_temp, NG_F0 = None, None
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+    print('Epoch: [{0}] Prec@1 {top1_tr.avg:.3f} Prec@5 {top5_tr.avg:.3f} Entropy_Loss {loss_en.avg:.4f}'
+          .format(epoch, top1_tr=top1_tr, top5_tr=top5_tr, loss_en=losses_en))
+
+    losses_tr.append(losses_en.avg)
+    tp1_tr.append(top1_tr.avg)
+    tp5_tr.append(top5_tr.avg)
+
+    return top1_tr.avg
 
 
-normalize       = transforms.Normalize(mean = [0.5, 0.5, 0.5], std = [0.5, 0.5, 0.5])
-transform_train = transforms.Compose([
-                     transforms.RandomCrop(32, padding=4),
-                     transforms.RandomHorizontalFlip(),
-                     transforms.ToTensor(),
-                     normalize])
-transform_test  = transforms.Compose([transforms.ToTensor(), normalize])
+def validate(val_loader, model, criterion, criterion_en, time_steps, leak):
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+    losses_en_eval = AverageMeter()
 
-if dataset == 'CIFAR10':
-    trainset    = datasets.CIFAR10(root = './cifar_data', train = True, download = True, transform = transform_train)
-    testset     = datasets.CIFAR10(root='./cifar_data', train=False, download=True, transform=                               transform_test)
-    labels      = 10
+    # switch to evaluate mode
+    model.eval()
 
-elif dataset == 'CIFAR100':
-    trainset    = datasets.CIFAR100(root = './cifar_data', train = True, download = True, transform = transform_train)
-    testset     = datasets.CIFAR100(root='./cifar_data', train=False, download=True, transform=                               transform_test)
-    labels      = 100
+    end = time.time()
+    for i, (input, target) in enumerate(val_loader):
+        # measure data loading time
+        data_time.update(time.time() - end)
+        labels = Variable(target.cuda())
+        target = target.cuda(async=True)
+        if device_num < 2:
+            input_var = Variable(input.cuda())
+        else:
+            input_var = torch.autograd.Variable(input)
 
-elif dataset == 'IMAGENET':
-    labels      = 1000
-    traindir    = os.path.join('/local/scratch/a/imagenet/imagenet2012/', 'train')
-    valdir      = os.path.join('/local/scratch/a/imagenet/imagenet2012/', 'val')
-    trainset    = datasets.ImageFolder(
-                        traindir,
-                        transforms.Compose([
-                            transforms.RandomResizedCrop(224),
-                            transforms.RandomHorizontalFlip(),
-                            transforms.ToTensor(),
-                            normalize,
-                        ]))
-    testset     = datasets.ImageFolder(
-                        valdir,
-                        transforms.Compose([
-                            transforms.Resize(256),
-                            transforms.CenterCrop(224),
-                            transforms.ToTensor(),
-                            normalize,
-                        ])) 
+        output = model.tst(input=input_var, steps=time_steps, l=leak)
+
+        targetN = output.data.clone().zero_().cuda()
+        targetN.scatter_(1, target.unsqueeze(1), 1)
+        targetN = Variable(targetN.type(torch.cuda.FloatTensor))
+        loss = criterion(output, targetN)
+        loss_en = criterion_en(output, labels).cuda()
+
+        # measure accuracy and record loss
+        prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+        losses.update(loss.data[0], input.size(0))
+        top1.update(prec1[0], input.size(0))
+        top5.update(prec5[0], input.size(0))
+        losses_en_eval.update(loss_en.data[0], input.size(0))
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+    print('Test: Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f} Entropy_Loss {losses_en_eval.avg:.4f}'
+          .format(top1=top1, top5=top5, losses_en_eval=losses_en_eval))
+
+    tp1.append(top1.avg)
+    tp5.append(top5.avg)
+    losses_eval.append(losses_en_eval.avg)
+
+    return top1.avg
 
 
-train_loader    = DataLoader(trainset, batch_size=batch_size, shuffle=True)
-test_loader     = DataLoader(testset, batch_size=batch_size, shuffle=False)
+def save_checkpoint(state, is_best, filename='checkpointT1_mnist1.pth.tar'):
+    torch.save(state, filename)
+    if is_best:
+        shutil.copyfile(filename, 'model_bestT1_mnist1.pth.tar')
 
-if architecture[0:3].lower() == 'vgg':
-        model = VGG_SNN_STDB(vgg_name = architecture, activation = activation, labels=labels, timesteps=timesteps, leak_mem=leak_mem, STDP_alpha=STDP_alpha, STDP_beta=STDP_beta)
-    
-elif architecture[0:3].lower() == 'res':
-        model = RESNET_SNN_STDB(name = architecture, labels=labels, timesteps=timesteps,leak_mem=leak_mem, STDP_alpha=STDP_alpha, STDP_beta=STDP_beta)
 
-if freeze_conv:
-    for param in model.features.parameters():
-        param.requires_grad = False
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
 
-model = nn.DataParallel(model) 
-if pretrained:
-        
-    if architecture[0:3].lower() == 'vgg':
-        state = torch.load(pretrained_state, map_location='cpu')
-        f.write('\n Variables loaded from pretrained model:')
-        
-        for key, value in state.items():
-            if isinstance(value, (int, float)):
-                f.write('\n {} : {}'.format(key, value))
-            else:
-                f.write('\n {}: '.format(key))
-        
-        model.load_state_dict(state['state_dict'])
+    def __init__(self):
+        self.reset()
 
-   
-    elif architecture[0:3].lower() == 'res':
-        state = torch.load(pretrained_state, map_location='cpu')
-        f.write('\n Variables loaded from pretrained model:')
-        for key, value in state.items():
-            if isinstance(value, (int, float)):
-                f.write('\n {} : {}'.format(key, value))
-            else:
-                f.write('\n {}: '.format(key))
-        model.load_state_dict(state['state_dict'])
-        
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
 
-if torch.cuda.is_available() and use_cuda:
-    model.cuda()
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
 
-optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=5e-4, amsgrad=False)
-criterion = nn.CrossEntropyLoss()
-max_correct = 0
-start_epoch = 1
 
-f.write('\nDataset                  :{} '.format(dataset))
-f.write('\nBatch Size               :{} '.format(batch_size))
-f.write('\nTimesteps                :{} '.format(timesteps))
-f.write('\nUpdate Interval (time)   :{} '.format(update_interval))
-f.write('\nMembrane Leak            :{} '.format(leak_mem))
-f.write('\nScaling Threshold        :{} '.format(scaling_threshold))
-f.write('\nActivation               :{} '.format(activation))
-f.write('\nArchitecture             :{} '.format(architecture))
-if pretrained:
-    f.write('\nPretrained Weight File   :{} '.format(pretrained_state))
-elif resume:
-    f.write('\nResumed from state       :{} '.format(resume))
-f.write('\nStarting Learning Rate   :{} '.format(learning_rate))
-f.write('\nLR Adjust Interval       :{} '.format(lr_adjust_interval))
-f.write('\nLR Decay Factor          :{} '.format(lr_decay_factor))
-f.write('\nSTDP_alpha               :{} '.format(STDP_alpha))
-f.write('\nSTDP_beta                :{} '.format(STDP_beta))
-f.write('\nOptimizer                :{} '.format(optimizer))
-f.write('\nCriterion                :{} '.format(criterion))
-f.write('\n{}'.format(model))
+def adjust_learning_rate(optimizer, epoch):
+    """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
+    lr = args.lr
 
-start_time = datetime.datetime.now()
+    for param_group in optimizer.param_groups:
+        if epoch >= change:
+            param_group['lr'] = 0.2 * lr
 
-ann_thresholds = []
+        elif epoch < change:
+            param_group['lr'] = lr
 
-if architecture.lower().startswith('vgg'):
-    for l in model.module.features.named_children():
-    
-        if isinstance(l[1], nn.Conv2d):
-            ann_thresholds.append(default_threshold)
-    
-    for l in model.module.classifier.named_children():
-    
-        if isinstance(l[1], nn.Linear):
-            ann_thresholds.append(default_threshold)
-    
-if architecture.lower().startswith('res'):
-    for l in model.module.pre_process.named_children():
-        if isinstance(l[1], nn.Conv2d):
-            ann_thresholds.append(default_threshold)
+    lRate.append(param_group['lr'])
 
-#VGG16 Imagenet thresholds
-#ann_thresholds = [10.16, 11.49, 2.65, 2.30, 0.77, 2.75, 1.33, 0.67, 1.13, 1.12, 0.43, 0.73, 1.08, 0.16, 0.58]
 
-#ResNet34 Imagenet thresholds
-#ann_thresholds = [8.73, 4.88, 5.80]
+def accuracy(output, target, topk=(1,)):
+    """Computes the precision@k for the specified values of k"""
+    maxk = max(topk)
+    batch_size = target.size(0)
 
-#VGG11 CIFAR100 thresholds
-#ann_thresholds = [15.56, 1.79, 3.51, 0.79, 1.04, 1.29, 0.22, 1.27, 0.62, 1.29]
+    _, pred = output.topk(maxk, 1, True, True)
+    pred = pred.t()
+    correct = pred.eq(target.view(1, -1).expand_as(pred))
 
-#VGG16 CIFAR10 thresholds
-ann_thresholds = [4.26, 2.87, 0.48, 1.34, 0.21, 0.87, 1.12, 0.17, 1.30, 4.46, 0.56, 2.18, 1.70, 1.35, 1.33]
+    res = []
+    for k in topk:
+        correct_k = correct[:k].view(-1).float().sum(0)
+        res.append(correct_k.mul_(100.0 / batch_size))
+    return res
 
-#VGG5 CIFAR10 thresholds
-#ann_thresholds = [12.70, 1.39, 1.65, 0.17, 0.54]
 
-thresholds_set = model.module.threshold_init(scaling_threshold=scaling_threshold, reset_threshold=reset_threshold, thresholds = ann_thresholds[:], default_threshold=default_threshold)
+class SpikingNN(torch.autograd.Function):
+    def forward(self, input):
+        self.save_for_backward(input)
+        return input.gt(0).type(torch.cuda.FloatTensor)
 
-f.write('\n Threshold: {}'.format(thresholds_set))
-#Uncomment to find firing thresholds
-#if pretrained and find_thesholds:
-#    find_threshold(ann_thresholds, train_loader)
-    
+    def backward(self, grad_output):
+        input, = self.saved_tensors
+        grad_input = grad_output.clone()
+        grad_input[input <= 0.0] = 0
+        return grad_input
 
-for epoch in range(start_epoch, 50):
-    
-    #train(epoch, train_loader)
-    test(epoch, test_loader)    
 
-f.write('\nHighest accuracy: {:.2f}%'.format(100*max_correct.item()/len(test_loader.dataset)))
+def LIF_sNeuron(membrane_potential, threshold, l, i):
+    # check exceed membrane potential and reset
+    ex_membrane = nn.functional.threshold(membrane_potential, threshold, 0)
+    membrane_potential = membrane_potential - ex_membrane
+    # generate spike
+    out = SpikingNN()(ex_membrane)
+    # decay
+    membrane_potential = l * membrane_potential.detach() + membrane_potential - membrane_potential.detach()
+    out = out.detach() + torch.div(out, threshold) - torch.div(out, threshold).detach()
+
+    return membrane_potential, out
+
+
+def LF_Unit(l, LF_output, Total_output, out, out_temp, i):
+    LF_output = l * LF_output + out
+    Total_output = Total_output + out
+    out_temp.append(out)
+
+    return LF_output, Total_output, out_temp[i]
+
+
+def Pooling_sNeuron(membrane_potential, threshold, i):
+    # check exceed membrane potential and reset
+    ex_membrane = nn.functional.threshold(membrane_potential, threshold, 0)
+    membrane_potential = membrane_potential - ex_membrane # hard reset
+    # generate spike
+    out = SpikingNN()(ex_membrane)
+
+    return membrane_potential, out
+
+
+class CNNModel(nn.Module):
+    def __init__(self):
+        super(CNNModel, self).__init__()
+        self.cnn1 = nn.Conv2d(in_channels=1, out_channels=20, kernel_size=5, stride=1, padding=2, bias=False)
+        self.avgpool1 = nn.AvgPool2d(kernel_size=2)
+
+        self.cnn2 = nn.Conv2d(in_channels=20, out_channels=50, kernel_size=5, stride=1, padding=2, bias=False)
+        self.avgpool2 = nn.AvgPool2d(kernel_size=2)
+
+        self.fc0 = nn.Linear(50*7*7, 200, bias=False)
+        self.fc1 = nn.Linear(200, 10, bias=False)
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.in_channels
+                variance1 = math.sqrt(2. / n)
+                m.weight.data.normal_(0, variance1)
+                # define threshold
+                m.threshold = 1
+
+            elif isinstance(m, nn.Linear):
+                size = m.weight.size()
+                fan_in = size[1]
+                variance2 = math.sqrt(2.0 / fan_in)
+                m.weight.data.normal_(0.0, variance2)
+                # define threshold
+                m.threshold = 1
+
+    def forward(self, input, steps=100, l=0.99):
+        out1_temp = []
+        out2_temp = []
+        outf0_temp = []
+
+        mem_1 = Variable(torch.zeros(input.size(0), 20, 28, 28).cuda(), requires_grad=False)
+        mem_1s = Variable(torch.zeros(input.size(0), 20, 14, 14).cuda(), requires_grad=False)
+
+        mem_2 = Variable(torch.zeros(input.size(0), 50, 14, 14).cuda(), requires_grad=False)
+        mem_2s = Variable(torch.zeros(input.size(0), 50, 7, 7).cuda(), requires_grad=False)
+
+        membrane_f0 = Variable(torch.zeros(input.size(0), 200).cuda(), requires_grad=False)
+        membrane_f1 = Variable(torch.zeros(input.size(0), 10).cuda(), requires_grad=True)
+
+        Total_1_output = Variable(torch.zeros(input.size(0), 20, 28, 28).cuda(), requires_grad=False)
+        LF_1_output = Variable(torch.zeros(input.size(0), 20, 28, 28).cuda(), requires_grad=False)
+
+        Total_2_output = Variable(torch.zeros(input.size(0), 50, 14, 14).cuda(), requires_grad=False)
+        LF_2_output = Variable(torch.zeros(input.size(0), 50, 14, 14).cuda(), requires_grad=False)
+
+        Total_f0_output = Variable(torch.zeros(input.size(0), 200).cuda(), requires_grad=False)
+        LF_f0_output = Variable(torch.zeros(input.size(0), 200).cuda(), requires_grad=False)
+
+        for i in range(steps):
+            # Poisson input spike generation
+            rand_num = Variable(torch.rand(input.size(0), input.size(1), input.size(2), input.size(3)).cuda())
+            Poisson_d_input = ((torch.abs(input)/2) > rand_num).type(torch.cuda.FloatTensor)
+            Poisson_d_input = torch.mul(Poisson_d_input, torch.sign(input))
+
+            # convolutional Layer
+            mem_1 = mem_1 + self.cnn1(Poisson_d_input)
+            mem_1, out = LIF_sNeuron(mem_1, self.cnn1.threshold, l, i)
+            LF_1_output, Total_1_output, out = LF_Unit(l, LF_1_output, Total_1_output, out, out1_temp, i)
+
+            # pooling Layer
+            mem_1s = mem_1s + self.avgpool1(out)
+            mem_1s, out = Pooling_sNeuron(mem_1s, 0.75, i)
+
+            # convolutional Layer
+            mem_2 = mem_2 + self.cnn2(out)
+            mem_2, out = LIF_sNeuron(mem_2, self.cnn2.threshold, l, i)
+            LF_2_output, Total_2_output, out = LF_Unit(l, LF_2_output, Total_2_output, out, out2_temp, i)
+
+            # pooling Layer
+            mem_2s = mem_2s + self.avgpool2(out)
+            mem_2s, out = Pooling_sNeuron(mem_2s, 0.75, i)
+
+            out = out.view(out.size(0), -1)
+
+            # fully-connected Layer
+            membrane_f0 = membrane_f0 + self.fc0(out)
+            membrane_f0, out = LIF_sNeuron(membrane_f0, self.fc0.threshold, l, i)
+            LF_f0_output, Total_f0_output, out = LF_Unit(l, LF_f0_output, Total_f0_output, out, outf0_temp, i)
+
+            membrane_f1 = membrane_f1 + self.fc1(out)
+            membrane_f1 = l * membrane_f1.detach() + membrane_f1 - membrane_f1.detach()
+
+        return membrane_f1 /self.fc1.threshold / steps, Total_1_output, LF_1_output, Total_2_output, LF_2_output, Total_f0_output, LF_f0_output, out1_temp, out2_temp, outf0_temp
+
+
+    def tst(self, input, steps=100, l=0.99):
+        mem_1 = Variable(torch.zeros(input.size(0), 20, 28, 28).cuda(), requires_grad=False, volatile=True)
+        mem_1s = Variable(torch.zeros(input.size(0), 20, 14, 14).cuda(), requires_grad=False, volatile=True)
+
+        mem_2 = Variable(torch.zeros(input.size(0), 50, 14, 14).cuda(), requires_grad=False, volatile=True)
+        mem_2s = Variable(torch.zeros(input.size(0), 50, 7, 7).cuda(), requires_grad=False, volatile=True)
+
+        membrane_f0 = Variable(torch.zeros(input.size(0), 200).cuda(), requires_grad=False, volatile=True)
+        membrane_f1 = Variable(torch.zeros(input.size(0), 10).cuda(), requires_grad=False, volatile=True)
+
+        for i in range(steps):
+            # Poisson input spike generation
+            rand_num = Variable(torch.rand(input.size(0), input.size(1), input.size(2), input.size(3)).cuda())
+            Poisson_d_input = ((torch.abs(input)/2) > rand_num).type(torch.cuda.FloatTensor)
+            Poisson_d_input = torch.mul(Poisson_d_input, torch.sign(input))
+
+            # convolutional Layer
+            mem_1 = mem_1 + self.cnn1(Poisson_d_input)
+            mem_1, out = LIF_sNeuron(mem_1, self.cnn1.threshold, l, i)
+
+            # pooling Layer
+            mem_1s = mem_1s + self.avgpool1(out)
+            mem_1s, out = Pooling_sNeuron(mem_1s, 0.75, i)
+
+            # convolutional Layer
+            mem_2 = mem_2 + self.cnn2(out)
+            mem_2, out = LIF_sNeuron(mem_2, self.cnn1.threshold, l, i)
+
+            # pooling Layer
+            mem_2s = mem_2s + self.avgpool2(out)
+            mem_2s, out = Pooling_sNeuron(mem_2s, 0.75, i)
+
+            out = out.view(out.size(0), -1)
+
+            # fully-connected Layer
+            membrane_f0 = membrane_f0 + self.fc0(out)
+            membrane_f0, out = LIF_sNeuron(membrane_f0, self.fc0.threshold, l, i)
+
+            membrane_f1 = membrane_f1 + self.fc1(out)
+            membrane_f1 = l * membrane_f1.detach() + membrane_f1 - membrane_f1.detach()
+
+        return membrane_f1 / self.fc1.threshold / steps
+
+if __name__ == '__main__':
+    main()
